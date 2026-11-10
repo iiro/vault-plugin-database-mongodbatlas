@@ -29,6 +29,13 @@ set the fields of the unused method to an empty string.
 The service account or API key needs the Project Database Access Admin role on the project.
 Service accounts also have an IP access list, and their secrets expire, so plan to rotate them.
 
+> [!WARNING]
+> Current Vault versions return `client_secret` in plain text to anyone who can read the
+> connection config. Reading `database/config/<name>` hides `password`, `private_key` and
+> `service_account_json`, but not `client_secret`. To check your Vault version, run
+> `vault read database/config/<name>` and look for `client_secret` under `connection_details`.
+> If it is there, restrict read access to `database/config/*`, or use an API key until you upgrade.
+
 ## Quick Links
 
 - [Database Secrets Engine for MongoDB Atlas - Docs](https://developer.hashicorp.com/vault/docs/secrets/databases/mongodbatlas)
