@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	dbplugin "github.com/hashicorp/vault/sdk/database/dbplugin/v5"
 	"github.com/hashicorp/vault/sdk/database/helper/connutil"
@@ -30,6 +31,11 @@ const (
 
 	// atlasTokenURL is the OAuth 2.0 token endpoint for Atlas service accounts.
 	atlasTokenURL = "https://cloud.mongodb.com/api/oauth/token"
+
+	// tokenRequestTimeout bounds a request for a service account access token.
+	// The token is fetched without a request context while the plugin's lock is
+	// held, so a stalled token endpoint must not block forever.
+	tokenRequestTimeout = 30 * time.Second
 )
 
 type mongoDBAtlasConnectionProducer struct {
@@ -46,6 +52,8 @@ type mongoDBAtlasConnectionProducer struct {
 	RawConfig   map[string]interface{}
 	Type        string
 	client      *mongodbatlas.Client
+	// tokenURL overrides atlasTokenURL in tests.
+	tokenURL string
 	sync.Mutex
 }
 
@@ -103,7 +111,11 @@ func (c *mongoDBAtlasConnectionProducer) Connection(_ context.Context) (interfac
 // with either the service account or the programmatic API key.
 func (c *mongoDBAtlasConnectionProducer) httpClient() (*http.Client, error) {
 	if c.ClientID != "" {
-		return serviceAccountClient(c.ClientID, c.ClientSecret, atlasTokenURL), nil
+		tokenURL := c.tokenURL
+		if tokenURL == "" {
+			tokenURL = atlasTokenURL
+		}
+		return serviceAccountClient(c.ClientID, c.ClientSecret, tokenURL, tokenRequestTimeout), nil
 	}
 
 	transport := digest.NewTransport(c.PublicKey, c.PrivateKey)
@@ -112,8 +124,9 @@ func (c *mongoDBAtlasConnectionProducer) httpClient() (*http.Client, error) {
 
 // serviceAccountClient returns an HTTP client that uses the OAuth 2.0 client
 // credentials flow. It fetches a token on first use and a new one when the
-// current token expires.
-func serviceAccountClient(clientID, clientSecret, tokenURL string) *http.Client {
+// current token expires. Token requests time out after timeout; API requests
+// are bounded by their own request context.
+func serviceAccountClient(clientID, clientSecret, tokenURL string, timeout time.Duration) *http.Client {
 	config := clientcredentials.Config{
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
@@ -122,19 +135,54 @@ func serviceAccountClient(clientID, clientSecret, tokenURL string) *http.Client 
 	}
 
 	// The client is cached and outlives any single request, so it must not
-	// use a request context.
-	return config.Client(context.Background())
+	// use a request context. oauth2 fetches tokens with the client in the
+	// context.
+	ctx := context.WithValue(context.Background(), oauth2.HTTPClient, &http.Client{Timeout: timeout})
+
+	// The API client is built here rather than with oauth2.NewClient, which
+	// would copy the token client's Timeout to it. API requests are bounded
+	// by their request context instead. config.TokenSource caches the token.
+	return &http.Client{
+		Transport: &oauth2.Transport{
+			Source: taggedTokenSource{config.TokenSource(ctx)},
+		},
+	}
+}
+
+// serviceAccountTokenError marks an error from fetching a service account
+// access token. It keeps only the message, so no *url.Error from the token
+// request stays in the chain.
+type serviceAccountTokenError struct {
+	msg string
+}
+
+func (e *serviceAccountTokenError) Error() string {
+	return e.msg
+}
+
+// taggedTokenSource returns every token error as a *serviceAccountTokenError.
+type taggedTokenSource struct {
+	src oauth2.TokenSource
+}
+
+func (s taggedTokenSource) Token() (*oauth2.Token, error) {
+	token, err := s.src.Token()
+	if err != nil {
+		return nil, &serviceAccountTokenError{msg: err.Error()}
+	}
+	return token, nil
 }
 
 // tokenError replaces an error from fetching a service account access token
 // with one that keeps the reason but doesn't wrap *url.Error. The HTTP client
-// wraps transport errors in *url.Error, and the database error sanitizer
-// replaces any such error with "unable to parse connection url", which would
-// hide causes such as an expired client secret.
+// wraps every transport error, including token errors, in *url.Error, and the
+// database error sanitizer replaces any such error with "unable to parse
+// connection url", which would hide causes such as an expired client secret
+// or an unreachable token endpoint.
 func tokenError(err error) error {
-	var retrieveErr *oauth2.RetrieveError
-	if errors.As(err, &retrieveErr) {
-		return fmt.Errorf("failed to get an Atlas service account access token: %s", retrieveErr)
+	var tokenErr *serviceAccountTokenError
+	if errors.As(err, &tokenErr) {
+		return fmt.Errorf("failed to get an Atlas service account access token: %s", tokenErr.msg)
 	}
 	return err
 }
