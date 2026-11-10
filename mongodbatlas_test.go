@@ -566,6 +566,63 @@ func TestAcceptanceDatabaseUser_UpdateUser_Password(t *testing.T) {
 	assertCredsExists(t, projectID, publicKey, privateKey, dbUser, newPassword, connURL, "")
 }
 
+// TestAcceptanceDatabaseUser_ServiceAccount_UpdateUser_Password changes a
+// user's password through a service account. The API key is still used to set
+// up and check the user.
+func TestAcceptanceDatabaseUser_ServiceAccount_UpdateUser_Password(t *testing.T) {
+	if !runAcceptanceTests {
+		t.SkipNow()
+	}
+
+	clientID := os.Getenv(envVarAtlasClientID)
+	clientSecret := os.Getenv(envVarAtlasClientSecret)
+	if clientID == "" || clientSecret == "" {
+		t.Skipf("%s and %s are not set", envVarAtlasClientID, envVarAtlasClientSecret)
+	}
+
+	publicKey := os.Getenv(envVarAtlasPublicKey)
+	privateKey := os.Getenv(envVarAtlasPrivateKey)
+	projectID := os.Getenv(envVarAtlasProjectID)
+	connURL := os.Getenv(envVarAtlasClusterName)
+
+	connectionDetails := map[string]interface{}{
+		"client_id":     clientID,
+		"client_secret": clientSecret,
+		"project_id":    projectID,
+	}
+
+	db := new()
+	defer dbtesting.AssertClose(t, db)
+
+	initReq := dbplugin.InitializeRequest{
+		Config: connectionDetails,
+	}
+
+	dbtesting.AssertInitialize(t, db, initReq)
+
+	// create the database user in advance, and test the connection
+	dbUser := "testmongousersa"
+	startingPassword := "myreallysecurepassword"
+
+	createAtlasDBUser(t, projectID, publicKey, privateKey, dbUser, startingPassword)
+	defer deleteAtlasDBUser(t, projectID, publicKey, privateKey, dbUser)
+
+	assertCredsExists(t, projectID, publicKey, privateKey, dbUser, startingPassword, connURL, "")
+
+	newPassword := "some-other-password"
+
+	updateReq := dbplugin.UpdateUserRequest{
+		Username: dbUser,
+		Password: &dbplugin.ChangePassword{
+			NewPassword: newPassword,
+		},
+	}
+
+	dbtesting.AssertUpdateUser(t, db, updateReq)
+
+	assertCredsExists(t, projectID, publicKey, privateKey, dbUser, newPassword, connURL, "")
+}
+
 func assertX509UserExist(t testing.TB, projectID, publicKey, privateKey, subject, connURL, expectedRolesAndScopesJSON string) {
 	t.Helper()
 
